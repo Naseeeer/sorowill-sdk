@@ -1,4 +1,5 @@
 import { rpc } from '@stellar/stellar-sdk';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import type { SoroWillRpcServer } from './SoroWillClient';
 import { computeBackoffDelay } from './requestQueue';
 
@@ -57,6 +58,101 @@ function assertValidRpcUrl(rpcUrl: string): URL {
   }
 
   return parsed;
+}
+
+/**
+ * Payloads larger than this (in bytes, measured on the UTF-8 encoded JSON
+ * body) are gzip-compressed before being sent to the RPC endpoint.
+ */
+export const DEFAULT_COMPRESSION_THRESHOLD_BYTES = 1024;
+
+/** Content-Encoding used for compressed RPC payloads. */
+export const RPC_COMPRESSION_ENCODING = 'gzip';
+
+/**
+ * Cumulative compression statistics, so callers can measure the savings
+ * achieved by compressing large RPC payloads.
+ */
+export interface RpcCompressionStats {
+  /** Number of request bodies that were compressed. */
+  compressedRequests: number;
+  /** Number of request bodies sent uncompressed. */
+  uncompressedRequests: number;
+  /** Total bytes of the uncompressed request bodies. */
+  requestBytesBefore: number;
+  /** Total bytes actually sent for those request bodies. */
+  requestBytesAfter: number;
+  /** Number of responses that were decompressed. */
+  decompressedResponses: number;
+  /** Number of responses that could not be decompressed and were used as-is. */
+  decompressionFallbacks: number;
+  /** Total bytes of compressed responses received. */
+  responseBytesBefore: number;
+  /** Total bytes of responses after decompression. */
+  responseBytesAfter: number;
+}
+
+/** Result of compressing a request body. */
+export interface CompressedPayload {
+  /** The body to send (compressed when `compressed` is `true`). */
+  body: Uint8Array;
+  /** Whether the body was compressed. */
+  compressed: boolean;
+  /** Size of the original (uncompressed) body in bytes. */
+  originalBytes: number;
+  /** Size of the returned body in bytes. */
+  bytes: number;
+}
+
+/**
+ * Compresses a JSON request body when it exceeds `thresholdBytes`. Compression
+ * is skipped (and the original bytes returned) when the body is small, when
+ * compression is disabled, or when compression fails or does not reduce the
+ * payload size — so an unsupported or unhelpful compressor never breaks a
+ * request.
+ */
+export function compressRpcPayload(
+  body: string | Uint8Array,
+  thresholdBytes: number = DEFAULT_COMPRESSION_THRESHOLD_BYTES,
+): CompressedPayload {
+  const raw = typeof body === 'string' ? new TextEncoder().encode(body) : body;
+  const originalBytes = raw.byteLength;
+
+  if (originalBytes <= thresholdBytes) {
+    return { body: raw, compressed: false, originalBytes, bytes: originalBytes };
+  }
+
+  try {
+    const compressed = new Uint8Array(gzipSync(raw));
+    if (compressed.byteLength >= originalBytes) {
+      return { body: raw, compressed: false, originalBytes, bytes: originalBytes };
+    }
+    return { body: compressed, compressed: true, originalBytes, bytes: compressed.byteLength };
+  } catch {
+    return { body: raw, compressed: false, originalBytes, bytes: originalBytes };
+  }
+}
+
+/**
+ * Decompresses a gzip-encoded RPC response body. When decompression is not
+ * possible (unsupported encoding, corrupt payload, or a compressor that is
+ * unavailable in the current runtime) the original bytes are returned
+ * unchanged so the caller can still parse the response.
+ */
+export function decompressRpcPayload(
+  body: Uint8Array,
+  contentEncoding?: string | null,
+): { body: Uint8Array; decompressed: boolean } {
+  const encoding = (contentEncoding ?? '').trim().toLowerCase();
+  if (encoding !== RPC_COMPRESSION_ENCODING && encoding !== 'x-gzip') {
+    return { body, decompressed: false };
+  }
+
+  try {
+    return { body: new Uint8Array(gunzipSync(body)), decompressed: true };
+  } catch {
+    return { body, decompressed: false };
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -484,6 +580,17 @@ export class RpcEndpointPool {
   /** Last health-check result per endpoint; `undefined` until first checked. */
   private healthy: Array<boolean | undefined> = [];
   private healthTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly compressionThresholdBytes: number;
+  private readonly compressionStats: RpcCompressionStats = {
+    compressedRequests: 0,
+    uncompressedRequests: 0,
+    requestBytesBefore: 0,
+    requestBytesAfter: 0,
+    decompressedResponses: 0,
+    decompressionFallbacks: 0,
+    responseBytesBefore: 0,
+    responseBytesAfter: 0,
+  };
 
   /**
    * @param serverOverride - When provided (e.g. `SoroWillClientOptions.rpcServer`
@@ -540,6 +647,7 @@ export class RpcEndpointPool {
     this.circuitBreakerCooldownMs = circuitBreaker?.cooldownMs ?? DEFAULT_CIRCUIT_BREAKER_COOLDOWN_MS;
     this.endpointBackoffBaseMs = endpointBackoffBaseMs;
     this.endpointBackoffMaxMs = endpointBackoffMaxMs;
+    this.compressionThresholdBytes = DEFAULT_COMPRESSION_THRESHOLD_BYTES;
     this.circuitStates = uniqueRpcUrls.map(() => ({
       failureCount: 0,
       quarantinedAt: null,
@@ -1036,5 +1144,79 @@ export class RpcEndpointPool {
       throw new Error('No active RPC server is configured');
     }
     return server;
+  }
+
+  /**
+   * Compresses a JSON-RPC request body when it exceeds the compression
+   * threshold, recording the byte savings. Returns the body to send and the
+   * headers that describe it.
+   */
+  prepareRequestPayload(body: string | Uint8Array): {
+    body: Uint8Array;
+    headers: Record<string, string>;
+  } {
+    const result = compressRpcPayload(body, this.compressionThresholdBytes);
+    this.compressionStats.requestBytesBefore += result.originalBytes;
+    this.compressionStats.requestBytesAfter += result.bytes;
+    if (result.compressed) {
+      this.compressionStats.compressedRequests += 1;
+      return {
+        body: result.body,
+        headers: {
+          'Content-Encoding': RPC_COMPRESSION_ENCODING,
+          'Content-Type': 'application/json',
+        },
+      };
+    }
+    this.compressionStats.uncompressedRequests += 1;
+    return { body: result.body, headers: { 'Content-Type': 'application/json' } };
+  }
+
+  /**
+   * Decompresses a response body according to its `Content-Encoding` header,
+   * falling back to the raw bytes when compression is unsupported or the
+   * payload cannot be decoded.
+   */
+  readResponsePayload(
+    body: Uint8Array,
+    contentEncoding?: string | null,
+  ): { body: Uint8Array; decompressed: boolean } {
+    const result = decompressRpcPayload(body, contentEncoding);
+    if (result.decompressed) {
+      this.compressionStats.decompressedResponses += 1;
+      this.compressionStats.responseBytesBefore += body.byteLength;
+      this.compressionStats.responseBytesAfter += result.body.byteLength;
+    } else if ((contentEncoding ?? '').trim().length > 0) {
+      this.compressionStats.decompressionFallbacks += 1;
+    }
+    return result;
+  }
+
+  /** Snapshot of the cumulative compression statistics for this pool. */
+  getCompressionStats(): RpcCompressionStats {
+    return { ...this.compressionStats };
+  }
+
+  /**
+   * Measures the savings achieved so far. Ratios are `0` when no bytes have
+   * been processed yet.
+   */
+  getCompressionSavings(): {
+    requestBytesSaved: number;
+    requestSavingsRatio: number;
+    responseBytesSaved: number;
+    responseSavingsRatio: number;
+  } {
+    const stats = this.compressionStats;
+    const requestBytesSaved = stats.requestBytesBefore - stats.requestBytesAfter;
+    const responseBytesSaved = stats.responseBytesAfter - stats.responseBytesBefore;
+    return {
+      requestBytesSaved,
+      requestSavingsRatio:
+        stats.requestBytesBefore > 0 ? requestBytesSaved / stats.requestBytesBefore : 0,
+      responseBytesSaved,
+      responseSavingsRatio:
+        stats.responseBytesAfter > 0 ? responseBytesSaved / stats.responseBytesAfter : 0,
+    };
   }
 }
