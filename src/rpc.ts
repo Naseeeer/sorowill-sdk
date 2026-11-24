@@ -259,6 +259,204 @@ export async function isTransactionResolved(
   }
 }
 
+/** Default number of confirmations (ledgers) required for finality. */
+export const DEFAULT_FINALITY_CONFIRMATIONS = 1;
+
+/** Default interval between finality status polls, in milliseconds. */
+export const DEFAULT_FINALITY_POLL_INTERVAL_MS = 1_000;
+
+/** Default overall timeout for waiting on finality, in milliseconds. */
+export const DEFAULT_FINALITY_TIMEOUT_MS = 60_000;
+
+/**
+ * Finality status of a submitted transaction.
+ *
+ * - `finalized` — the transaction succeeded and is buried under at least the
+ *   requested number of confirmations.
+ * - `failed` — the transaction reached a terminal `FAILED` state on-chain.
+ * - `pending` — the transaction is not yet included in a ledger.
+ * - `timeout` — the transaction did not reach finality within the timeout.
+ */
+export type FinalityStatus = 'finalized' | 'failed' | 'pending' | 'timeout';
+
+/** Result of {@link waitForTransactionFinality}. */
+export interface TransactionFinalityResult {
+  /** The transaction hash that was checked. */
+  hash: string;
+  /** Finality status at the time the check settled. */
+  status: FinalityStatus;
+  /** Number of confirmations observed (0 while pending). */
+  confirmations: number;
+  /** Number of confirmations that were required. */
+  requiredConfirmations: number;
+  /** Ledger sequence the transaction was included in, when known. */
+  ledger?: number;
+  /** Latest ledger sequence observed while polling, when known. */
+  latestLedger?: number;
+  /** Total time spent waiting, in milliseconds. */
+  elapsedMs: number;
+}
+
+/** Options for {@link waitForTransactionFinality}. */
+export interface WaitForTransactionFinalityOptions {
+  /** Transaction hash to check. */
+  hash: string;
+  /**
+   * Number of confirmations (ledgers on top of the inclusion ledger) required
+   * before the transaction is considered final. Defaults to
+   * {@link DEFAULT_FINALITY_CONFIRMATIONS}.
+   */
+  confirmations?: number;
+  /** Overall timeout in milliseconds. Defaults to {@link DEFAULT_FINALITY_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  /** Delay between status polls in milliseconds. Defaults to {@link DEFAULT_FINALITY_POLL_INTERVAL_MS}. */
+  pollIntervalMs?: number;
+  /** Optional RPC server override (e.g. a pooled/failover server). */
+  server?: SoroWillRpcServer;
+  /** Optional abort signal to stop waiting early. */
+  signal?: AbortSignal;
+}
+
+/** Minimal RPC surface needed to check finality. */
+interface FinalityRpcServer {
+  getTransaction(hash: string): Promise<rpc.Api.GetTransactionResponse>;
+  getLatestLedger?(): Promise<{ sequence: number }>;
+}
+
+function assertNonNegativeInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative integer, received ${value}`);
+  }
+}
+
+/**
+ * Checks the finality of a transaction once, without waiting.
+ *
+ * A transaction is `finalized` when it succeeded and the latest ledger is at
+ * least `confirmations` ledgers ahead of its inclusion ledger. It is `failed`
+ * when the network reports a terminal `FAILED` status, and `pending` when it
+ * has not been included yet (or its status cannot be determined).
+ */
+export async function checkTransactionFinality(
+  server: FinalityRpcServer,
+  hash: string,
+  confirmations: number = DEFAULT_FINALITY_CONFIRMATIONS,
+): Promise<TransactionFinalityResult> {
+  assertNonNegativeInteger(confirmations, 'confirmations');
+
+  const startedAt = Date.now();
+  const base: TransactionFinalityResult = {
+    hash,
+    status: 'pending',
+    confirmations: 0,
+    requiredConfirmations: confirmations,
+    elapsedMs: 0,
+  };
+
+  let response: rpc.Api.GetTransactionResponse;
+  try {
+    response = await server.getTransaction(hash);
+  } catch {
+    // Not indexed yet (or a transient lookup failure): treat as pending.
+    return base;
+  }
+
+  const status = (response as { status?: unknown }).status;
+  if (status === rpc.Api.GetTransactionStatus.FAILED) {
+    return { ...base, status: 'failed', elapsedMs: Date.now() - startedAt };
+  }
+  if (status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+    return base;
+  }
+
+  const ledger = (response as { ledger?: unknown }).ledger;
+  const inclusionLedger = typeof ledger === 'number' ? ledger : undefined;
+
+  let latestLedger: number | undefined;
+  if (server.getLatestLedger) {
+    try {
+      latestLedger = (await server.getLatestLedger()).sequence;
+    } catch {
+      latestLedger = undefined;
+    }
+  }
+
+  const observed =
+    inclusionLedger !== undefined && latestLedger !== undefined
+      ? Math.max(0, latestLedger - inclusionLedger)
+      : 0;
+
+  const result: TransactionFinalityResult = {
+    ...base,
+    confirmations: observed,
+    elapsedMs: Date.now() - startedAt,
+  };
+  if (inclusionLedger !== undefined) result.ledger = inclusionLedger;
+  if (latestLedger !== undefined) result.latestLedger = latestLedger;
+
+  if (observed >= confirmations) {
+    result.status = 'finalized';
+  }
+  return result;
+}
+
+/**
+ * Waits until a transaction is finalized (succeeded and buried under
+ * `confirmations` ledgers), fails on-chain, or the timeout elapses.
+ *
+ * Never throws for a transaction that simply does not land in time: the
+ * returned {@link TransactionFinalityResult} carries `status: 'timeout'` so
+ * callers can decide whether to retry, fee-bump, or surface an error.
+ */
+export async function waitForTransactionFinality(
+  options: WaitForTransactionFinalityOptions,
+): Promise<TransactionFinalityResult> {
+  const confirmations = options.confirmations ?? DEFAULT_FINALITY_CONFIRMATIONS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FINALITY_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_FINALITY_POLL_INTERVAL_MS;
+
+  assertNonNegativeInteger(confirmations, 'confirmations');
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError(`timeoutMs must be a non-negative number, received ${timeoutMs}`);
+  }
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new RangeError(`pollIntervalMs must be a positive number, received ${pollIntervalMs}`);
+  }
+
+  const server = options.server as FinalityRpcServer | undefined;
+  if (!server) {
+    throw new Error('waitForTransactionFinality requires an RPC server');
+  }
+
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let last: TransactionFinalityResult = {
+    hash: options.hash,
+    status: 'pending',
+    confirmations: 0,
+    requiredConfirmations: confirmations,
+    elapsedMs: 0,
+  };
+
+  for (;;) {
+    if (options.signal?.aborted) {
+      return { ...last, status: 'timeout', elapsedMs: Date.now() - startedAt };
+    }
+
+    last = await checkTransactionFinality(server, options.hash, confirmations);
+    if (last.status === 'finalized' || last.status === 'failed') {
+      return { ...last, elapsedMs: Date.now() - startedAt };
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return { ...last, status: 'timeout', elapsedMs: Date.now() - startedAt };
+    }
+
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+  }
+}
+
 /**
  * Maximum number of recent latency samples kept per endpoint for weighted
  * selection. Older samples are evicted to keep the window current.

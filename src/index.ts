@@ -15,6 +15,18 @@ export {
   buildContractInstanceLedgerKey,
 } from './SoroWillClient';
 export { MAX_CHECKIN_PERIOD_DAYS } from './SoroWillClient';
+export {
+  checkTransactionFinality,
+  waitForTransactionFinality,
+  DEFAULT_FINALITY_CONFIRMATIONS,
+  DEFAULT_FINALITY_POLL_INTERVAL_MS,
+  DEFAULT_FINALITY_TIMEOUT_MS,
+} from './rpc';
+export type {
+  FinalityStatus,
+  TransactionFinalityResult,
+  WaitForTransactionFinalityOptions,
+} from './rpc';
 export type {
   ContractStorageDurability,
   EventSubscription,
