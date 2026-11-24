@@ -341,10 +341,44 @@ export interface UpdateBeneficiariesParams {
   readonly beneficiaries: readonly Beneficiary[];
 }
 
-/** Optional client-side pagination controls for list-style SDK methods. */
+/**
+ * Optional client-side pagination controls for list-style SDK methods
+ * (`getWillsByOwner`, `getWillsByBeneficiary`).
+ *
+ * Two styles are supported and may be combined:
+ *
+ * - **Offset/limit** — pass `offset` (number of records to skip) and/or
+ *   `limit` (maximum records to return). `pageSize` is an alias for `limit`.
+ * - **Cursor-based** — pass the opaque `cursor` from a previous page's
+ *   `nextCursor`. Cursors are stable indexes into the SDK's sorted result
+ *   list, so pages never overlap or skip records while the underlying set is
+ *   unchanged.
+ *
+ * When both `cursor` and `offset` are supplied, `cursor` wins.
+ *
+ * @example
+ * ```ts
+ * // Offset/limit
+ * const page = await client.getWillsByOwner(owner, { offset: 20, limit: 10 });
+ *
+ * // Cursor-based
+ * let cursor: string | undefined;
+ * do {
+ *   const page = await client.getWillsByOwner(owner, { limit: 10, cursor });
+ *   cursor = page.nextCursor ?? undefined;
+ * } while (cursor);
+ * ```
+ */
 export interface PaginationOptions {
-  /** Maximum number of wills to return in this page. */
+  /**
+   * Maximum number of wills to return in this page. Alias for {@link limit};
+   * when both are set, `limit` wins.
+   */
   pageSize?: number;
+  /** Maximum number of wills to return in this page. */
+  limit?: number;
+  /** Number of wills to skip from the start of the sorted result list. */
+  offset?: number;
   /** Opaque cursor returned by the previous page, if any. */
   cursor?: string | undefined;
 }
@@ -352,7 +386,18 @@ export interface PaginationOptions {
 /** A page of wills plus the cursor needed to fetch the next page, if any. */
 export interface PaginatedWillsResult {
   readonly wills: Will[];
+  /** Cursor for the next page, or `null` when this is the last page. */
   readonly nextCursor: string | null;
+  /** Cursor for the previous page, or `null` when this is the first page. */
+  readonly prevCursor: string | null;
+  /** Offset of the first record in this page within the sorted result list. */
+  readonly offset: number;
+  /** Maximum number of records requested for this page, if any. */
+  readonly limit: number | null;
+  /** Total number of records available across all pages. */
+  readonly total: number;
+  /** Whether more records exist after this page. */
+  readonly hasMore: boolean;
 }
 
 

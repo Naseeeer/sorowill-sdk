@@ -897,6 +897,46 @@ function normalizePositiveInteger(value: number | undefined, label: string): num
 }
 
 /**
+ * Validates a non-negative integer pagination option (`offset`). Unlike
+ * {@link normalizePositiveInteger}, zero is accepted because skipping zero
+ * records is the first page.
+ */
+function normalizeNonNegativeInteger(value: number | undefined, label: string): number | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!Number.isInteger(value) || value < 0) {
+    throw new InvalidPaginationOptionsError(label, value);
+  }
+  return value;
+}
+
+/**
+ * Resolves the effective page size from `limit` (preferred) or its `pageSize`
+ * alias, validating both when present.
+ */
+function resolvePageSize(options: PaginationOptions | undefined): number | null {
+  const limit = normalizePositiveInteger(options?.limit, 'limit');
+  const pageSize = normalizePositiveInteger(options?.pageSize, 'pageSize');
+  return limit ?? pageSize;
+}
+
+/**
+ * Validates every pagination option on `options` up front so callers get a
+ * typed error before any cache lookup or RPC round-trip.
+ */
+function validatePaginationOptions(options: PaginationOptions | undefined): void {
+  if (!options) {
+    return;
+  }
+  if (options.cursor !== undefined) {
+    parseCursor(options.cursor);
+  }
+  resolvePageSize(options);
+  normalizeNonNegativeInteger(options.offset, 'offset');
+}
+
+/**
  * Validates that `amount` is a string representing a positive integer before
  * it is passed to `BigInt()`. Throws {@link SoroWillInvalidAmountError} for
  * zero, negative, or malformed (non-numeric) strings so callers get a clear,
@@ -2501,13 +2541,17 @@ export class SoroWillClient {
    *
    * **Read-only operation** — does not require wallet authentication.
    *
+   * Supports both offset/limit (`{ offset, limit }`) and cursor-based
+   * (`{ cursor }`) pagination; see {@link PaginationOptions}.
+   *
    * @param owner - The Stellar public key of the will owner.
    * @param options - Pagination options plus optional timeout/abort signal.
    * @returns A paginated page of will records.
    *
    * @example
    * ```ts
-   * const wills = await client.getWillsByOwner('GISSUE559...');
+   * const page = await client.getWillsByOwner('GISSUE559...', { offset: 0, limit: 20 });
+   * const next = await client.getWillsByOwner('GISSUE559...', { cursor: page.nextCursor! });
    * ```
    */
   async getWillsByOwner(
@@ -2520,13 +2564,7 @@ export class SoroWillClient {
   ): Promise<Will[] | PaginatedWillsResult> {
     // #612: reject malformed addresses before they reach the cache key or RPC.
     assertValidStellarAddress(owner, 'owner', { allowContract: true });
-    const paginationOptions = options as PaginationOptions | undefined;
-    if (paginationOptions?.cursor !== undefined) {
-      parseCursor(paginationOptions.cursor);
-    }
-    if (paginationOptions?.pageSize !== undefined) {
-      normalizePositiveInteger(paginationOptions.pageSize, 'pageSize');
-    }
+    validatePaginationOptions(options as PaginationOptions | undefined);
     const cacheKey = createReadCacheKey('get_wills_by_owner', { owner });
     if (this.readCache && !options?.skipCache) {
       await this.readCache.ready();
@@ -2578,13 +2616,16 @@ export class SoroWillClient {
    *
    * **Read-only operation** — does not require wallet authentication.
    *
+   * Supports both offset/limit (`{ offset, limit }`) and cursor-based
+   * (`{ cursor }`) pagination; see {@link PaginationOptions}.
+   *
    * @param beneficiary - The Stellar public key of the beneficiary.
    * @param options - Pagination options plus optional timeout/abort signal.
    * @returns A paginated page of will records.
    *
    * @example
    * ```ts
-   * const wills = await client.getWillsByBeneficiary('GISSUE559...');
+   * const page = await client.getWillsByBeneficiary('GISSUE559...', { limit: 20 });
    * ```
    */
   async getWillsByBeneficiary(
@@ -2597,13 +2638,7 @@ export class SoroWillClient {
   ): Promise<Will[] | PaginatedWillsResult> {
     // #612: reject malformed addresses before they reach the cache key or RPC.
     assertValidStellarAddress(beneficiary, 'beneficiary', { allowContract: true });
-    const paginationOptions = options as PaginationOptions | undefined;
-    if (paginationOptions?.cursor !== undefined) {
-      parseCursor(paginationOptions.cursor);
-    }
-    if (paginationOptions?.pageSize !== undefined) {
-      normalizePositiveInteger(paginationOptions.pageSize, 'pageSize');
-    }
+    validatePaginationOptions(options as PaginationOptions | undefined);
     const cacheKey = createReadCacheKey('get_wills_by_beneficiary', { beneficiary });
     if (this.readCache && !options?.skipCache) {
       await this.readCache.ready();
@@ -2632,9 +2667,13 @@ export class SoroWillClient {
 
   /**
    * Applies optional client-side pagination to an already-fetched list of
-   * wills. Returns the plain list unchanged when neither `pageSize` nor
-   * `cursor` is present on `options`, so callers who don't ask for
-   * pagination keep getting a plain `Will[]`.
+   * wills. Returns the plain list unchanged when no pagination option
+   * (`pageSize`, `limit`, `offset`, or `cursor`) is present on `options`, so
+   * callers who don't ask for pagination keep getting a plain `Will[]`.
+   *
+   * Supports both offset/limit pagination (`offset` + `limit`/`pageSize`) and
+   * cursor-based pagination (`cursor` from a previous `nextCursor`). When both
+   * are supplied, `cursor` takes precedence over `offset`.
    *
    * Sort order guarantee: wills are always returned sorted ascending by
    * `will_id`, so cursors are consistent across calls.
@@ -2644,14 +2683,33 @@ export class SoroWillClient {
     options?: (PaginationOptions & RequestOptions) | RequestOptions,
   ): Will[] | PaginatedWillsResult {
     const paginationOptions = options as PaginationOptions | undefined;
-    if (!paginationOptions || (paginationOptions.pageSize === undefined && paginationOptions.cursor === undefined)) {
+    if (
+      !paginationOptions ||
+      (paginationOptions.pageSize === undefined &&
+        paginationOptions.limit === undefined &&
+        paginationOptions.offset === undefined &&
+        paginationOptions.cursor === undefined)
+    ) {
       return wills;
     }
-    const pageSize = normalizePositiveInteger(paginationOptions.pageSize, 'pageSize') ?? wills.length;
-    const start = parseCursor(paginationOptions.cursor);
+    const limit = resolvePageSize(paginationOptions);
+    const start =
+      paginationOptions.cursor !== undefined
+        ? parseCursor(paginationOptions.cursor)
+        : (normalizeNonNegativeInteger(paginationOptions.offset, 'offset') ?? 0);
+    const pageSize = limit ?? Math.max(wills.length - start, 0);
     const page = wills.slice(start, start + pageSize);
     const nextIndex = start + page.length;
-    return { wills: page, nextCursor: nextIndex < wills.length ? String(nextIndex) : null };
+    const hasMore = nextIndex < wills.length;
+    return {
+      wills: page,
+      nextCursor: hasMore ? String(nextIndex) : null,
+      prevCursor: start > 0 ? String(Math.max(start - pageSize, 0)) : null,
+      offset: start,
+      limit,
+      total: wills.length,
+      hasMore,
+    };
   }
 
   /**
