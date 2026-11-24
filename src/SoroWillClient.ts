@@ -1123,6 +1123,9 @@ function validateContractIdFormat(contractId: unknown): asserts contractId is st
 /** How long {@link SoroWillClient.willStatus} may serve a cached status (#726). */
 const WILL_STATUS_CACHE_TTL_MS = 30_000;
 
+/** How long {@link SoroWillClient.getContractVersion} may serve a cached version (#792). */
+const CONTRACT_VERSION_CACHE_TTL_MS = 60 * 60 * 1000;
+
 /** Maximum number of items accepted by the batch helpers (#727). */
 const MAX_BATCH_OPERATIONS = 25;
 
@@ -1173,6 +1176,8 @@ export class SoroWillClient {
   private readonly deduplicateReads: boolean;
   /** Per-will status cache backing {@link SoroWillClient.willStatus} (#726). */
   private readonly statusCache = new Map<string, { status: WillStatus; expiresAt: number }>();
+  /** Cached deployed contract version backing {@link SoroWillClient.getContractVersion} (#792). */
+  private contractVersionCache: { version: string; expiresAt: number } | undefined;
   /**
    * Read simulations currently in flight, keyed by method + arguments +
    * request options, so identical concurrent reads share one RPC call (#619).
